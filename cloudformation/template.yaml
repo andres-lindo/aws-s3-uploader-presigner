@@ -1,0 +1,291 @@
+Description: "S3 Uploader & Presigner"
+Resources:
+    S3BucketWebSite:
+        Type: "AWS::S3::Bucket"
+
+    CloudFrontCloudFrontOriginAccessIdentity:
+      Type: "AWS::CloudFront::CloudFrontOriginAccessIdentity"
+      Properties:
+          CloudFrontOriginAccessIdentityConfig: 
+              Comment: !Sub "access-identity-${S3BucketWebSite}.s3.amazonaws.com"                  
+
+    S3BucketPolicy:
+        Type: "AWS::S3::BucketPolicy"
+        Properties:
+            Bucket: !Ref S3BucketWebSite
+            PolicyDocument: 
+                Version: "2008-10-17"
+                Id: "PolicyForCloudFrontPrivateContent"
+                Statement: 
+                  - 
+                    Sid: "1"
+                    Effect: "Allow"
+                    Principal: 
+                        AWS: !Sub "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontCloudFrontOriginAccessIdentity}"
+                    Action: "s3:GetObject"
+                    Resource: !Sub "arn:aws:s3:::${S3BucketWebSite}/*"
+              
+                    
+    CloudFrontDistribution:
+      Type: "AWS::CloudFront::Distribution"
+      Properties:
+        DistributionConfig:
+          DefaultRootObject: "index.html"
+          Origins:
+            - DomainName: !Sub "${S3BucketWebSite}.s3.amazonaws.com"
+              Id: "s3-upload-presigner"
+              OriginPath: ""
+              S3OriginConfig:
+                OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontCloudFrontOriginAccessIdentity}"
+          OriginGroups:
+            Quantity: 0
+          DefaultCacheBehavior:
+            AllowedMethods:
+              - "HEAD"
+              - "GET"
+            CachedMethods:
+              - "HEAD"
+              - "GET"
+            Compress: false
+            DefaultTTL: 86400
+            ForwardedValues:
+              Cookies:
+                Forward: "none"
+              QueryString: false
+            MaxTTL: 31536000
+            MinTTL: 0
+            SmoothStreaming: false
+            TargetOriginId: "s3-upload-presigner"
+            ViewerProtocolPolicy: "allow-all"
+          Comment: "S3 Uploader & Presigner"
+          PriceClass: "PriceClass_All"
+          Enabled: true
+          ViewerCertificate:
+            CloudFrontDefaultCertificate: true
+            MinimumProtocolVersion: "TLSv1"
+          Restrictions:
+            GeoRestriction:
+              RestrictionType: "none"
+          HttpVersion: "http2"
+          IPV6Enabled: true
+
+    S3BucketStorage:
+        Type: "AWS::S3::Bucket"
+        Properties:
+            BucketEncryption: 
+                ServerSideEncryptionConfiguration: 
+                  - 
+                    ServerSideEncryptionByDefault: 
+                        SSEAlgorithm: "AES256"
+            LifecycleConfiguration: 
+                Rules: 
+                  - 
+                    AbortIncompleteMultipartUpload: 
+                        DaysAfterInitiation: 1
+                    Id: "DeleteObjects"
+                    Status: "Enabled"
+                    ExpirationInDays: 7
+                    NoncurrentVersionExpirationInDays: 7
+            CorsConfiguration: 
+                CorsRules: 
+                  - 
+                    AllowedHeaders: 
+                      - "*"
+                    AllowedMethods: 
+                      - "PUT"
+                    AllowedOrigins: 
+                      - !Sub 'https://${CloudFrontDistribution.DomainName}'
+            VersioningConfiguration: 
+                Status: "Enabled"
+
+    IAMUser:
+      Type: AWS::IAM::User        
+
+    IAMAccessKey:
+      Type: AWS::IAM::AccessKey
+      Properties:
+        UserName:
+          Ref: IAMUser
+
+    LambdaExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: "/"
+        Policies:
+          - PolicyName: CloudWatchLogsPermissions
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:*
+                  Resource: arn:aws:logs:*:*:*
+          - PolicyName: S3BucketStoragePermissions
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                  Resource:
+                    - !Sub "arn:aws:s3:::${S3BucketStorage}/*"
+
+    LambdaFunction:
+      Type: AWS::Lambda::Function
+      DependsOn: ["LambdaExecutionRole"]
+      Properties:
+        Role: !GetAtt LambdaExecutionRole.Arn
+        Runtime: "python3.7"
+        Timeout: 600
+        Description: "Lambda function to generate S3 pre-signed URLs"
+        Handler: "index.lambda_handler"
+        Environment:
+          Variables:
+            access_key: !Ref IAMAccessKey
+            secret_key: !GetAtt "IAMAccessKey.SecretAccessKey"
+            bucket_name: !Ref S3BucketStorage
+        Code:
+          ZipFile: |
+                  import boto3
+                  import json
+                  import base64
+                  import os
+
+                  def lambda_handler(event, context):
+                      
+                      access_key = os.environ['access_key']
+                      secret_key = os.environ['secret_key']
+                      bucket = os.environ['bucket_name']
+                      
+                      contentType = event["headers"]["content-type"]
+                      fileName = event["headers"]["file-name"]
+                      method = event["headers"]["method"]
+                      
+                      s3 = boto3.client('s3',
+                          aws_access_key_id=access_key,
+                          aws_secret_access_key=secret_key,
+                      )
+                      
+                      if method == "GET":
+                          response = s3.generate_presigned_url(
+                              ClientMethod='get_object',
+                              Params={
+                                  'Bucket': bucket,
+                                  'Key': fileName
+                              },
+                              ExpiresIn=604800,
+                          )
+                          
+                      if method == "PUT":
+                          response = s3.generate_presigned_url(
+                              ClientMethod='put_object',
+                              Params={
+                                  'Bucket': bucket,
+                                  'Key': fileName,
+                                  'ContentType': contentType
+                              }
+                          )
+
+                      return {
+                          "signed_url": response
+                      }
+
+
+    HttpApi:
+      Type: AWS::ApiGatewayV2::Api
+      DependsOn: LambdaFunction
+      Properties:
+        Name: "s3-uploader-presigner"
+        ProtocolType: HTTP
+        Target: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunction}/invocations
+        CorsConfiguration:
+          AllowOrigins: 
+            - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          AllowMethods: 
+            - POST
+            - OPTIONS
+          AllowHeaders: 
+            - '*' 
+
+    ApiTriggerLambdaPermission:
+      Type: "AWS::Lambda::Permission"
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !GetAtt LambdaFunction.Arn
+        Principal: apigateway.amazonaws.com
+        SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/signer' 
+
+    ApiLambdaProxyIntegration:
+      Type: "AWS::ApiGatewayV2::Integration"
+      Properties:
+        Description: Lambda Integration
+        ConnectionType: INTERNET
+        IntegrationMethod: POST
+        IntegrationUri: !Sub  "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction.Arn}/invocations"
+        PayloadFormatVersion: '1.0'
+        ApiId: !Ref HttpApi
+        IntegrationType: AWS_PROXY
+        PayloadFormatVersion: '2.0'      
+
+    ApiRoute:
+      Type: 'AWS::ApiGatewayV2::Route'
+      DependsOn:
+        - ApiLambdaProxyIntegration
+      Properties:
+        ApiId: !Ref HttpApi
+        RouteKey: 'POST /signer'
+        AuthorizationType: NONE
+        Target: !Join 
+          - /
+          - - integrations
+            - !Ref ApiLambdaProxyIntegration
+
+    ApiDeployment:
+      Type: 'AWS::ApiGatewayV2::Deployment'
+      DependsOn:
+        - ApiRoute
+      Properties:
+        Description: Api Deployment
+        ApiId: !Ref HttpApi             
+
+    ApiStage:
+      Type: AWS::ApiGatewayV2::Stage
+      Properties: 
+        ApiId: !Ref HttpApi
+        DeploymentId: !Ref ApiDeployment
+        Description: Api Stage
+        StageName: prod
+        
+Outputs:
+  S3BucketWebSite:
+    Value: !Ref S3BucketWebSite
+    Description: Name of the Amazon S3 bucket that contains the static web site objects.
+  S3BucketStorage:
+    Value: !Ref S3BucketStorage
+    Description: Name of the Amazon S3 bucket used to store objects uploaded by users.    
+  CloudFrontDistribution:
+    Value: !Ref CloudFrontDistribution
+    Description: Cloud Front Distribution ID.
+  WebSiteUrl:
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Description: Web site URL
+  ApiEndpoint:
+    Value: !Sub '${HttpApi.ApiEndpoint}/${ApiStage}'
+    Description: API Gateway Endpoint 
+    
+    
+    
+
+
+
+
